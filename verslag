@@ -1,0 +1,124 @@
+1. Inleiding
+
+In dit project werd een slim beveiligingssysteem ontwikkeld op basis van een ESP32-C6 microcontroller. Het systeem combineert toegangscontrole, bewegingsdetectie en branddetectie met een IoT-platform (Blynk) voor realtime monitoring.
+
+Het doel van dit project is om een veilig, interactief en op afstand bestuurbaar alarmsysteem te bouwen dat zowel fysieke als digitale beveiliging integreert.
+
+2. Doelstelling
+
+De belangrijkste doelstellingen van het systeem zijn:
+
+Detecteren van beweging (inbraak)
+Controleren van toegang via RFID en PIN-code
+Detecteren van hoge temperatuur (brand)
+Automatisch openen/sluiten van een deur (servo)
+Real-time monitoring via smartphone (Blynk)
+Alarm activeren bij ongeautoriseerde toegang
+
+
+3. Gebruikte Componenten
+
+Het systeem maakt gebruik van verschillende hardwarecomponenten:
+
+ESP32-C6 – centrale microcontroller
+RC522 RFID module – badge herkenning
+DHT11 sensor – temperatuurmeting
+HC-SR04 ultrasonic sensor – bewegingsdetectie
+Servo motor – deur openen/sluiten
+LEDs (groen, rood, temperatuur) – statusindicatie
+Buzzer – alarmgeluid
+Drukknoppen – PIN-code invoer
+
+
+4. Werking van het Systeem
+4.1 Toestanden (States)
+
+Het systeem werkt met verschillende statussen:
+
+IDLE → wacht op beweging
+DETECTIE → beweging gedetecteerd
+ENTRY_DELAY → tijd om badge te scannen
+PIN → gebruiker voert code in
+UNLOCKED → toegang toegestaan
+ALARM → inbraakalarm actief
+
+
+4.2 Toegangscontrole
+Beweging wordt gedetecteerd via ultrasonic sensor
+Gebruiker moet binnen 15 seconden een RFID badge scannen
+Daarna moet een PIN-code (1122) ingevoerd worden
+Bij correcte invoer:
+Deur gaat open (servo)
+Groene LED gaat aan
+Bij fout:
+Alarm wordt geactiveerd
+4.3 Alarmfunctie
+
+Bij een foutieve badge of verkeerde PIN:
+
+Rode LED knippert
+Buzzer gaat af
+Deur opent (veiligheidsmaatregel)
+Alleen juiste badge kan alarm stoppen
+
+
+4.4 Branddetectie
+
+De temperatuur wordt gemeten via de DHT11 sensor.
+
+Als de temperatuur hoger is dan 25°C:
+
+Brandalarm wordt geactiveerd
+Buzzer gaat aan
+Temperatuur LED knippert
+Deur opent automatisch (nooduitgang)
+
+
+5. IoT Integratie met Blynk
+
+Het systeem is verbonden met de Blynk IoT app, waarmee de gebruiker alles kan monitoren.
+
+Functies in de app:
+LED’s handmatig bedienen
+Temperatuur bekijken
+Afstand (beweging) bekijken
+Systeemstatus uitlezen
+Virtual Pins:
+V0 → Groene LED
+V1 → Rode LED
+V2 → Temp LED
+V3 → Temperatuur
+V4 → Afstand
+V5 → Status
+
+6. Sterke Punten van het Project
+Goede structuur met state machine
+Combinatie van meerdere sensoren
+Realtime monitoring via app
+Veiligheidslogica (deur opent bij brand)
+Gebruik van RFID + PIN (2-factor authenticatie)
+
+7. Zwakke Punten (en hier moet je eerlijk over zijn)
+
+Ik ga het niet mooier maken dan het is:
+
+DHT11 is te onnauwkeurig voor echte branddetectie
+Geen back-up systeem (bij stroomuitval = systeem dood)
+WiFi afhankelijk → bij netwerkproblemen werkt Blynk niet
+PIN met 2 knoppen is traag en beperkt
+Geen logging van gebeurtenissen (heel belangrijk in echte systemen)
+
+8. Mogelijke Verbeteringen
+
+Als je dit wil upgraden naar een top-project:
+
+Gebruik DHT22 of echte rooksensor (MQ-2)
+Voeg batterij backup toe
+Gebruik keypad i.p.v. 2 knoppen
+Voeg database/logging toe
+Maak mobile notificaties (push alerts)
+9. Conclusie
+
+Dit project toont aan dat het mogelijk is om een slim beveiligingssysteem te bouwen met IoT-technologie. Door het combineren van sensoren, toegangscontrole en een mobiele applicatie ontstaat een interactief en veilig systeem.
+
+Hoewel er nog verbeterpunten zijn, vormt dit systeem een sterke basis voor verdere ontwikkeling richting professionele beveiligingsoplossingen.
