@@ -1,0 +1,11 @@
+Componenten in het systeem:
+MFRC522 — RFID-lezer die badges/kaarten scant via SPI-bus (5 draden: SDA=10, SCK=6, MOSI=7, MISO=2, RST=3). Herkent de badge met UID C3 4F 1A 1F.
+DHT11 — temperatuur- en vochtigheidssensor op GPIO 0. Stuurt brandalarm bij ≥25°C.
+HC-SR04 — ultrasone afstandssensor op GPIO 4 (TRIG) en GPIO 5 (ECHO). Detecteert beweging binnen 100 cm.
+Servo motor — opent/sluit de deur op GPIO 1. Staat op 0° (dicht) of 90° (open).
+Groene LED op GPIO 20 — brandt bij toegang toegestaan of idle.
+Rode LED op GPIO 21 — knippert bij beveiligingsalarm.
+Temp LED op GPIO 22 — knippert bij brandalarm.
+Buzzer op GPIO 23 — geluidssignaal bij alarm.
+Knop 1 op GPIO 8 — invoer cijfer 1 voor PIN-code.
+Knop 2 op GPIO 9 — invoer cijfer 2 voor PIN-code.
