@@ -1,0 +1,598 @@
+/*
+ * ============================================================
+ *  ESP32-C6 BEVEILIGINGSSYSTEEM
+ *  RFID + PIN + Ultrasonic + DHT11 + Servo + LEDs + Buzzer
+ *  + BLYNK IOT INTEGRATIE
+ * ============================================================
+ *
+ * PINOUT:
+ *  RFID RC522  : SDA=10, SCK=6, MOSI=7, MISO=2, RST=3
+ *  Groene LED  : GPIO 20
+ *  Rode LED    : GPIO 21 (beveiliging/alarm)
+ *  Temp LED    : GPIO 22 (temperatuur/brand)
+ *  Buzzer      : GPIO 23
+ *  Servo       : GPIO 1
+ *  HC-SR04     : TRIG=4, ECHO=5
+ *  DHT11       : GPIO 0
+ *  Knop 1      : GPIO 8  (cijfer 1)
+ *  Knop 2      : GPIO 9  (cijfer 2)
+ *
+ * BLYNK VIRTUAL PINS:
+ *  V0  → Groene LED aan/uit (Button widget, mode: Switch)
+ *  V1  → Rode LED aan/uit   (Button widget, mode: Switch)
+ *  V2  → Temp LED aan/uit   (Button widget, mode: Switch)
+ *  V3  → Temperatuur °C     (Label of Gauge widget)
+ *  V4  → Afstand cm         (Label of Gauge widget)
+ *  V5  → Systeemstatus      (Label widget)
+ *
+ * BENODIGDE LIBRARIES:
+ *  - MFRC522        (door GithubCommunity)
+ *  - DHT sensor library (door Adafruit)
+ *  - ESP32Servo     (door Kevin Harrington)
+ *  - Blynk          (door Volodymyr Shymanskyy) v1.x
+ *
+ * SERVO GEDRAG (deur/raam):
+ *  0°  = gesloten (startpositie)
+ *  90° = open
+ *
+ * ============================================================
+ */
+
+// ─── BLYNK CONFIGURATIE ──────────────────────────────────────
+// Vul hieronder jouw eigen gegevens in!
+#define BLYNK_TEMPLATE_ID   "TMPLxxxxxx"       // ← jouw Template ID
+#define BLYNK_TEMPLATE_NAME "Beveiligingssysteem"
+#define BLYNK_AUTH_TOKEN    "jouw_auth_token_hier"  // ← jouw Auth Token
+
+#define BLYNK_PRINT Serial  // Blynk debug naar seriële monitor
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+#include <SPI.h>
+#include <MFRC522.h>
+#include <DHT.h>
+#include <ESP32Servo.h>
+
+// ─── WIFI INSTELLINGEN ───────────────────────────────────────
+char ssid[] = "jouw_wifi_naam";      // ← jouw WiFi SSID
+char pass[] = "jouw_wifi_wachtwoord"; // ← jouw WiFi wachtwoord
+
+// ─── BLYNK VIRTUAL PIN NUMMERS ───────────────────────────────
+#define VPIN_LED_GROEN    V0
+#define VPIN_LED_ROOD     V1
+#define VPIN_LED_TEMP     V2
+#define VPIN_TEMPERATUUR  V3
+#define VPIN_AFSTAND      V4
+#define VPIN_STATUS       V5
+
+// ─── PIN DEFINITIE ───────────────────────────────────────────
+#define PIN_LED_GROEN     20
+#define PIN_LED_ROOD      21
+#define PIN_LED_TEMP      22
+#define PIN_BUZZER        23
+#define PIN_SERVO          1
+#define PIN_TRIG           4
+#define PIN_ECHO           5
+#define PIN_DHT            0
+#define PIN_KNOP1          8
+#define PIN_KNOP2          9
+
+// RFID SPI pins
+#define PIN_RFID_SS       10
+#define PIN_RFID_RST       3
+
+// ─── CONSTANTEN ──────────────────────────────────────────────
+#define DHT_TYPE          DHT11
+#define DETECTIE_AFSTAND  100   // cm - bewegingsdetectie drempel
+#define TEMP_DREMPEL      25.0  // graden C - brandalarm drempel
+#define ENTRY_DELAY       15000 // ms - tijd om badge te scannen
+#define DEBOUNCE_DELAY    200   // ms - knop debounce
+#define RFID_COOLDOWN     2000  // ms - wachttijd tussen scans
+#define BLYNK_UPDATE_MS   2000  // ms - hoe vaak Blynk data vernieuwen
+
+// Servo posities
+#define SERVO_GESLOTEN     0    // graden - startpositie (deur dicht)
+#define SERVO_OPEN        90    // graden - open positie (deur open)
+
+// ─── STATES ──────────────────────────────────────────────────
+#define STATE_IDLE          0
+#define STATE_DETECTIE      1
+#define STATE_ENTRY_DELAY   2
+#define STATE_PIN           3
+#define STATE_UNLOCKED      4
+#define STATE_ALARM         5
+
+// ─── OBJECTEN ────────────────────────────────────────────────
+MFRC522 rfid(PIN_RFID_SS, PIN_RFID_RST);
+DHT dht(PIN_DHT, DHT_TYPE);
+Servo servoMotor;
+BlynkTimer blynkTimer;
+
+// ─── GLOBALE VARIABELEN ──────────────────────────────────────
+int state = STATE_IDLE;
+bool printedState = false;
+
+unsigned long entryTime = 0;
+
+const int geheimeCode[] = {1, 1, 2, 2};
+int invoer[4];
+int invoerIndex = 0;
+int pogingen = 0;
+
+unsigned long lastKnop1 = 0;
+unsigned long lastKnop2 = 0;
+
+unsigned long alarmBlinkTimer = 0;
+bool alarmBlinkState = false;
+
+unsigned long tempCheckTimer = 0;
+bool tempAlarm = false;
+bool tempAlarmGeprint = false;
+
+unsigned long rfidCooldownTimer = 0;
+
+// Toegestane badge UID: C3 4F 1A 1F
+byte toegestaneUID[] = {0xC3, 0x4F, 0x1A, 0x1F};
+const int uidLengte = 4;
+
+bool servoDicht = true;
+
+// Blynk LED overschrijving vanuit app (true = app heeft controle)
+bool blynkGroenOverride = false;
+bool blynkRoodOverride  = false;
+bool blynkTempOverride  = false;
+
+// ─── BLYNK: LED BEDIENING VANUIT APP ─────────────────────────
+
+// Groene LED aan/uit via Blynk app (V0)
+BLYNK_WRITE(VPIN_LED_GROEN) {
+  int waarde = param.asInt();
+  blynkGroenOverride = (waarde == 1);
+  digitalWrite(PIN_LED_GROEN, waarde);
+  Serial.print("[BLYNK] Groene LED via app: ");
+  Serial.println(waarde ? "AAN" : "UIT");
+}
+
+// Rode LED aan/uit via Blynk app (V1)
+BLYNK_WRITE(VPIN_LED_ROOD) {
+  int waarde = param.asInt();
+  blynkRoodOverride = (waarde == 1);
+  digitalWrite(PIN_LED_ROOD, waarde);
+  Serial.print("[BLYNK] Rode LED via app: ");
+  Serial.println(waarde ? "AAN" : "UIT");
+}
+
+// Temp LED aan/uit via Blynk app (V2)
+BLYNK_WRITE(VPIN_LED_TEMP) {
+  int waarde = param.asInt();
+  blynkTempOverride = (waarde == 1);
+  digitalWrite(PIN_LED_TEMP, waarde);
+  Serial.print("[BLYNK] Temp LED via app: ");
+  Serial.println(waarde ? "AAN" : "UIT");
+}
+
+// ─── BLYNK: DATA VERSTUREN NAAR APP ──────────────────────────
+void stuurBlynkData() {
+  // Temperatuur uitlezen en versturen (V3)
+  float temp = dht.readTemperature();
+  if (!isnan(temp)) {
+    Blynk.virtualWrite(VPIN_TEMPERATUUR, temp);
+  }
+
+  // Afstand uitlezen en versturen (V4)
+  float afstand = meetAfstand();
+  if (afstand > 0) {
+    Blynk.virtualWrite(VPIN_AFSTAND, afstand);
+  }
+
+  // LED statussen spiegelen naar Blynk (V0, V1, V2)
+  // Alleen updaten als Blynk NIET in override-modus staat
+  if (!blynkGroenOverride) {
+    Blynk.virtualWrite(VPIN_LED_GROEN, digitalRead(PIN_LED_GROEN));
+  }
+  if (!blynkRoodOverride) {
+    Blynk.virtualWrite(VPIN_LED_ROOD, digitalRead(PIN_LED_ROOD));
+  }
+  if (!blynkTempOverride) {
+    Blynk.virtualWrite(VPIN_LED_TEMP, digitalRead(PIN_LED_TEMP));
+  }
+
+  // Systeemstatus als tekst (V5)
+  String statusTekst = "";
+  if (tempAlarm) {
+    statusTekst = "!! BRANDALARM !!";
+  } else {
+    switch (state) {
+      case STATE_IDLE:        statusTekst = "Wacht op beweging";       break;
+      case STATE_DETECTIE:    statusTekst = "Beweging gedetecteerd!";  break;
+      case STATE_ENTRY_DELAY: statusTekst = "Scan uw badge...";        break;
+      case STATE_PIN:         statusTekst = "Voer PIN-code in...";     break;
+      case STATE_UNLOCKED:    statusTekst = "Toegang toegestaan";      break;
+      case STATE_ALARM:       statusTekst = "!! BEVEILIGINGSALARM !!"; break;
+      default:                statusTekst = "Onbekend";                break;
+    }
+  }
+  Blynk.virtualWrite(VPIN_STATUS, statusTekst);
+}
+
+// ─── BLYNK: VERBINDING HERSTELD ──────────────────────────────
+BLYNK_CONNECTED() {
+  Serial.println("[BLYNK] Verbonden met Blynk server!");
+  // Huidige LED statussen direct synchroniseren bij herverbinding
+  Blynk.syncVirtual(VPIN_LED_GROEN);
+  Blynk.syncVirtual(VPIN_LED_ROOD);
+  Blynk.syncVirtual(VPIN_LED_TEMP);
+}
+
+// ─── SETUP ───────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(PIN_LED_GROEN, OUTPUT);
+  pinMode(PIN_LED_ROOD,  OUTPUT);
+  pinMode(PIN_LED_TEMP,  OUTPUT);
+  pinMode(PIN_BUZZER,    OUTPUT);
+  pinMode(PIN_TRIG,      OUTPUT);
+  pinMode(PIN_ECHO,      INPUT);
+  pinMode(PIN_KNOP1,     INPUT_PULLUP);
+  pinMode(PIN_KNOP2,     INPUT_PULLUP);
+
+  servoMotor.attach(PIN_SERVO);
+  servoSluit();
+
+  SPI.begin(6, 2, 7, 10); // SCK, MISO, MOSI, SS
+  rfid.PCD_Init();
+
+  dht.begin();
+  alleLedsUit();
+  buzzerUit();
+
+  // ── Blynk + WiFi verbinden ──
+  Serial.println("[BLYNK] Verbinden met WiFi en Blynk...");
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  // Timer instellen voor periodieke Blynk updates (elke 2 seconden)
+  blynkTimer.setInterval(BLYNK_UPDATE_MS, stuurBlynkData);
+
+  Serial.println("===========================================");
+  Serial.println("  ESP32-C6 Beveiligingssysteem opgestart  ");
+  Serial.println("===========================================");
+  Serial.println("  Badge UID : C3 4F 1A 1F                 ");
+  Serial.println("  PIN code  : 1122                         ");
+  Serial.println("  Servo 0   = deur gesloten                ");
+  Serial.println("  Servo 90  = deur open                    ");
+  Serial.println("  Blynk V0  = Groene LED                   ");
+  Serial.println("  Blynk V1  = Rode LED                     ");
+  Serial.println("  Blynk V2  = Temp LED                     ");
+  Serial.println("  Blynk V3  = Temperatuur (°C)             ");
+  Serial.println("  Blynk V4  = Afstand (cm)                 ");
+  Serial.println("  Blynk V5  = Systeemstatus                ");
+  Serial.println("===========================================");
+}
+
+// ─── LOOP ────────────────────────────────────────────────────
+void loop() {
+  Blynk.run();       // Blynk verbinding onderhouden
+  blynkTimer.run();  // Blynk timer voor periodieke updates
+
+  controleerTemperatuur();
+
+  switch (state) {
+    case STATE_IDLE:        verwerkIdle();       break;
+    case STATE_DETECTIE:    verwerkDetectie();   break;
+    case STATE_ENTRY_DELAY: verwerkEntryDelay(); break;
+    case STATE_PIN:         verwerkPin();        break;
+    case STATE_UNLOCKED:    verwerkUnlocked();   break;
+    case STATE_ALARM:       verwerkAlarm();      break;
+  }
+}
+
+// ─── STATE: IDLE ─────────────────────────────────────────────
+void verwerkIdle() {
+  if (!printedState) {
+    alleLedsUit();
+    digitalWrite(PIN_LED_GROEN, HIGH);
+    buzzerUit();
+    servoSluit();
+    Serial.println("\n[IDLE] Systeem actief - wacht op beweging...");
+    printedState = true;
+  }
+
+  float afstand = meetAfstand();
+  if (afstand > 0 && afstand < DETECTIE_AFSTAND) {
+    wisselState(STATE_DETECTIE);
+  }
+}
+
+// ─── STATE: DETECTIE ─────────────────────────────────────────
+void verwerkDetectie() {
+  if (!printedState) {
+    alleLedsUit();
+    digitalWrite(PIN_LED_ROOD, HIGH);
+    Serial.println("\n[DETECTIE] Beweging gedetecteerd!");
+    printedState = true;
+  }
+  entryTime = millis();
+  wisselState(STATE_ENTRY_DELAY);
+}
+
+// ─── STATE: ENTRY_DELAY ──────────────────────────────────────
+void verwerkEntryDelay() {
+  if (!printedState) {
+    Serial.println("[ENTRY_DELAY] Scan uw badge binnen 15 seconden...");
+    printedState = true;
+  }
+
+  unsigned long verstreken = millis() - entryTime;
+  unsigned long resterend = ENTRY_DELAY - verstreken;
+
+  static unsigned long lastSecPrint = 0;
+  if (millis() - lastSecPrint > 1000) {
+    Serial.print("  Resterende tijd: ");
+    Serial.print(resterend / 1000);
+    Serial.println(" sec");
+    lastSecPrint = millis();
+  }
+
+  if (verstreken >= ENTRY_DELAY) {
+    Serial.println("[ENTRY_DELAY] Tijd verstreken! Geen badge gescand.");
+    servoOpen();
+    wisselState(STATE_ALARM);
+    return;
+  }
+
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    if (controleerRFID()) {
+      Serial.println("[RFID] Badge herkend - voer code in (1122)");
+      invoerIndex = 0;
+      pogingen = 0;
+      memset(invoer, 0, sizeof(invoer));
+      rfid.PICC_HaltA();
+      wisselState(STATE_PIN);
+    } else {
+      Serial.println("[RFID] Onbekende badge! ALARM!");
+      rfid.PICC_HaltA();
+      servoOpen();
+      wisselState(STATE_ALARM);
+    }
+  }
+}
+
+// ─── STATE: PIN ──────────────────────────────────────────────
+void verwerkPin() {
+  if (!printedState) {
+    Serial.println("[PIN] Voer 4-cijferige code in (knop1=1, knop2=2)");
+    printedState = true;
+  }
+
+  if (digitalRead(PIN_KNOP1) == LOW && millis() - lastKnop1 > DEBOUNCE_DELAY) {
+    lastKnop1 = millis();
+    verwerkCijfer(1);
+  }
+
+  if (digitalRead(PIN_KNOP2) == LOW && millis() - lastKnop2 > DEBOUNCE_DELAY) {
+    lastKnop2 = millis();
+    verwerkCijfer(2);
+  }
+}
+
+void verwerkCijfer(int cijfer) {
+  if (invoerIndex >= 4) return;
+
+  invoer[invoerIndex] = cijfer;
+  invoerIndex++;
+
+  Serial.print("  Invoer: ");
+  for (int i = 0; i < invoerIndex; i++) Serial.print("*");
+  Serial.println();
+
+  if (invoerIndex == 4) {
+    delay(100);
+    if (controleerPIN()) {
+      Serial.println("[PIN] Code correct!");
+      wisselState(STATE_UNLOCKED);
+    } else {
+      pogingen++;
+      Serial.print("[PIN] Fout! Poging ");
+      Serial.print(pogingen);
+      Serial.println("/3");
+
+      if (pogingen >= 3) {
+        Serial.println("[PIN] 3x fout - ALARM!");
+        servoOpen();
+        wisselState(STATE_ALARM);
+      } else {
+        Serial.println("[PIN] Probeer opnieuw...");
+        invoerIndex = 0;
+        memset(invoer, 0, sizeof(invoer));
+        printedState = true;
+      }
+    }
+  }
+}
+
+// ─── STATE: UNLOCKED ─────────────────────────────────────────
+void verwerkUnlocked() {
+  if (!printedState) {
+    alleLedsUit();
+    digitalWrite(PIN_LED_GROEN, HIGH);
+    buzzerUit();
+    servoOpen();
+    Serial.println("\n[UNLOCKED] Toegang toegestaan - deur open");
+    Serial.println("[UNLOCKED] Deur sluit automatisch na 5 seconden...");
+    printedState = true;
+  }
+
+  static unsigned long unlockedTimer = 0;
+  if (unlockedTimer == 0) unlockedTimer = millis();
+
+  if (millis() - unlockedTimer > 5000) {
+    unlockedTimer = 0;
+    servoSluit();
+    Serial.println("[UNLOCKED] Deur gesloten - systeem reset.");
+    wisselState(STATE_IDLE);
+  }
+}
+
+// ─── STATE: ALARM ────────────────────────────────────────────
+void verwerkAlarm() {
+  if (!printedState) {
+    Serial.println("\n[ALARM] !!! BEVEILIGINGSALARM GEACTIVEERD !!!");
+    Serial.println("[ALARM] Scan de juiste badge om alarm te stoppen.");
+    printedState = true;
+    rfidCooldownTimer = millis();
+  }
+
+  // Rode LED knipperen
+  if (millis() - alarmBlinkTimer > 300) {
+    alarmBlinkTimer = millis();
+    alarmBlinkState = !alarmBlinkState;
+    digitalWrite(PIN_LED_ROOD, alarmBlinkState ? HIGH : LOW);
+  }
+
+  digitalWrite(PIN_BUZZER, HIGH);
+
+  if (millis() - rfidCooldownTimer < RFID_COOLDOWN) return;
+
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    if (controleerRFID()) {
+      Serial.println("[ALARM] Juiste badge gescand - ALARM GESTOPT!");
+      Serial.println("[ALARM] Deur wordt gesloten...");
+      rfid.PICC_HaltA();
+      digitalWrite(PIN_LED_ROOD, LOW);
+      buzzerUit();
+      servoSluit();
+      // Override resetten zodat systeem weer controle heeft
+      blynkRoodOverride = false;
+      wisselState(STATE_IDLE);
+    } else {
+      Serial.println("[ALARM] Verkeerde badge - alarm blijft actief!");
+      rfid.PICC_HaltA();
+      rfidCooldownTimer = millis();
+    }
+  }
+}
+
+// ─── TEMPERATUUR ALARM (altijd actief) ───────────────────────
+void controleerTemperatuur() {
+  if (millis() - tempCheckTimer < 2000) return;
+  tempCheckTimer = millis();
+
+  float temp = dht.readTemperature();
+  if (isnan(temp)) return;
+
+  if (temp >= TEMP_DREMPEL) {
+    if (!tempAlarm) {
+      tempAlarm = true;
+      tempAlarmGeprint = false;
+      rfidCooldownTimer = millis();
+      servoOpen();
+      Serial.println("[TEMP] Deur geopend als nooduitgang!");
+    }
+    if (!tempAlarmGeprint) {
+      Serial.print("[TEMP] !! Temperatuur te hoog: ");
+      Serial.print(temp);
+      Serial.println(" graden C - BRAND ALARM!");
+      Serial.println("[TEMP] Scan juiste badge om te resetten (na afkoeling)");
+      tempAlarmGeprint = true;
+    }
+
+    // Temp LED knipperen
+    static unsigned long tempBlinkTimer = 0;
+    static bool tempBlinkState = false;
+    if (millis() - tempBlinkTimer > 200) {
+      tempBlinkTimer = millis();
+      tempBlinkState = !tempBlinkState;
+      digitalWrite(PIN_LED_TEMP, tempBlinkState ? HIGH : LOW);
+    }
+
+    digitalWrite(PIN_BUZZER, HIGH);
+
+  } else {
+    if (tempAlarm) {
+      if (millis() - rfidCooldownTimer >= RFID_COOLDOWN) {
+        if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+          if (controleerRFID()) {
+            Serial.println("[TEMP] Juiste badge - BRANDALARM GESTOPT!");
+            Serial.println("[TEMP] Deur wordt gesloten...");
+            rfid.PICC_HaltA();
+            tempAlarm = false;
+            tempAlarmGeprint = false;
+            digitalWrite(PIN_LED_TEMP, LOW);
+            buzzerUit();
+            servoSluit();
+            blynkTempOverride = false;
+            Serial.println("[TEMP] Systeem hervat.");
+          } else {
+            Serial.println("[TEMP] Verkeerde badge - brandalarm blijft actief!");
+            rfid.PICC_HaltA();
+            rfidCooldownTimer = millis();
+          }
+        }
+      }
+    }
+  }
+}
+
+// ─── HULPFUNCTIES ────────────────────────────────────────────
+
+float meetAfstand() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+
+  long duur = pulseIn(PIN_ECHO, HIGH, 30000);
+  if (duur == 0) return -1;
+
+  return duur * 0.034 / 2.0;
+}
+
+bool controleerRFID() {
+  if (rfid.uid.size != uidLengte) return false;
+  for (int i = 0; i < uidLengte; i++) {
+    if (rfid.uid.uidByte[i] != toegestaneUID[i]) return false;
+  }
+  return true;
+}
+
+bool controleerPIN() {
+  for (int i = 0; i < 4; i++) {
+    if (invoer[i] != geheimeCode[i]) return false;
+  }
+  return true;
+}
+
+void alleLedsUit() {
+  digitalWrite(PIN_LED_GROEN, LOW);
+  digitalWrite(PIN_LED_ROOD,  LOW);
+}
+
+void buzzerUit() {
+  if (!tempAlarm) {
+    digitalWrite(PIN_BUZZER, LOW);
+  }
+}
+
+void servoSluit() {
+  servoMotor.write(SERVO_GESLOTEN);
+  servoDicht = true;
+}
+
+void servoOpen() {
+  servoMotor.write(SERVO_OPEN);
+  servoDicht = false;
+}
+
+void wisselState(int nieuweState) {
+  state = nieuweState;
+  printedState = false;
+  alarmBlinkState = false;
+  // Override vlaggen resetten bij state wissel
+  blynkGroenOverride = false;
+  blynkRoodOverride  = false;
+  blynkTempOverride  = false;
+}
